@@ -15,8 +15,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip build-essential git zip unzip \
-            openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev \
-            libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
+            openjdk-17-jdk autoconf automake libtool libtool-bin libltdl-dev \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake \
+            libffi-dev libssl-dev
 
       - name: Install buildozer
         run: pip3 install buildozer cython==0.29.33

@@ -1,27 +1,42 @@
-name: Build Android APK
+name: Build APK
 
 on:
   push:
-    branches: [ main, master ]
-  workflow_dispatch: {}
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip build-essential git zip unzip \
+            openjdk-17-jdk autoconf automake libtool libtool-bin libltdl-dev \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake \
+            libffi-dev libssl-dev
+
+      - name: Install buildozer
+        run: pip3 install buildozer cython==0.29.33
 
       - name: Build with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+        run: |
+          set -o pipefail
+          yes | buildozer android debug 2>&1 | tee build_log.txt
 
-      - name: Upload APK artifact
+      - name: Upload build log (always, even on failure)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: henxdownloader-apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          name: build-log
+          path: build_log.txt
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: henx-downloader-apk
+          path: bin/*.apk

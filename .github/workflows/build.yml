@@ -22,9 +22,19 @@ jobs:
         run: pip3 install buildozer cython==0.29.33
 
       - name: Build with Buildozer
-        run: yes | buildozer android debug
+        run: |
+          set -o pipefail
+          yes | buildozer android debug 2>&1 | tee build_log.txt
+
+      - name: Upload build log (always, even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_log.txt
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: henx-downloader-apk

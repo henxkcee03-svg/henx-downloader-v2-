@@ -23,17 +23,55 @@ from kivy.metrics import dp
 import yt_dlp
 
 # ---------- Palette ----------
-BG = (0.055, 0.063, 0.086, 1)
-SURFACE = (0.098, 0.114, 0.145, 1)
-SURFACE_2 = (0.13, 0.15, 0.19, 1)
-BORDER = (0.19, 0.22, 0.27, 1)
+# ACCENT/ACCENT_2/GOOD/BAD/WARN are the "special" colors — they stay the
+# same in both themes (buttons, badges, active toggles). Everything else
+# (BG/SURFACE/SURFACE_2/BORDER/TEXT_PRIMARY/TEXT_MUTED) switches between
+# a true black/white/grey dark mode and a light mode via apply_palette().
 ACCENT = (0.18, 0.65, 1.0, 1)
 ACCENT_2 = (0.36, 0.85, 0.75, 1)
-TEXT_PRIMARY = (0.95, 0.96, 0.98, 1)
-TEXT_MUTED = (0.55, 0.6, 0.68, 1)
 GOOD = (0.35, 0.85, 0.55, 1)
 BAD = (0.98, 0.42, 0.45, 1)
 WARN = (0.98, 0.75, 0.3, 1)
+
+DARK_PALETTE = {
+    'BG': (0, 0, 0, 1),
+    'SURFACE': (0.09, 0.09, 0.09, 1),
+    'SURFACE_2': (0.17, 0.17, 0.17, 1),
+    'BORDER': (0.3, 0.3, 0.3, 1),
+    'TEXT_PRIMARY': (1, 1, 1, 1),
+    'TEXT_MUTED': (0.62, 0.62, 0.62, 1),
+}
+LIGHT_PALETTE = {
+    'BG': (0.96, 0.96, 0.97, 1),
+    'SURFACE': (1, 1, 1, 1),
+    'SURFACE_2': (0.92, 0.92, 0.94, 1),
+    'BORDER': (0.83, 0.83, 0.86, 1),
+    'TEXT_PRIMARY': (0.07, 0.08, 0.1, 1),
+    'TEXT_MUTED': (0.42, 0.44, 0.5, 1),
+}
+
+BG = DARK_PALETTE['BG']
+SURFACE = DARK_PALETTE['SURFACE']
+SURFACE_2 = DARK_PALETTE['SURFACE_2']
+BORDER = DARK_PALETTE['BORDER']
+TEXT_PRIMARY = DARK_PALETTE['TEXT_PRIMARY']
+TEXT_MUTED = DARK_PALETTE['TEXT_MUTED']
+
+
+def apply_palette(name):
+    """Swaps the module-level neutral colors. Every widget builder reads
+    these names fresh at construction time, so rebuilding the screens
+    after calling this picks up the new theme automatically."""
+    global BG, SURFACE, SURFACE_2, BORDER, TEXT_PRIMARY, TEXT_MUTED
+    pal = DARK_PALETTE if name == 'dark' else LIGHT_PALETTE
+    BG = pal['BG']
+    SURFACE = pal['SURFACE']
+    SURFACE_2 = pal['SURFACE_2']
+    BORDER = pal['BORDER']
+    TEXT_PRIMARY = pal['TEXT_PRIMARY']
+    TEXT_MUTED = pal['TEXT_MUTED']
+    Window.clearcolor = BG
+
 
 Window.clearcolor = BG
 
@@ -142,6 +180,30 @@ class ProfileIcon(VectorIcon):
         head_cx, head_cy = x + w * 0.5, y + h * 0.72
         self._head.circle = (head_cx, head_cy, head_r)
         self._shoulders.ellipse = (x + w * 0.14, y + h * 0.02, w * 0.72, h * 0.62, 180, 360)
+
+
+class HelpIcon(VectorIcon):
+    """A simple question-mark glyph, hand-drawn as a curve + dot to match
+    the other icons instead of relying on a font's '?' glyph."""
+    def _build(self):
+        self._ring = Line(width=dp(1.8))
+        self._hook = Line(width=dp(1.9), cap='round', joint='round')
+        self._dot = Line(width=dp(2.4), cap='round')
+
+    def _redraw(self, *args):
+        super()._redraw(*args)
+        x, y = self.pos
+        w, h = self.size
+        cx = x + w * 0.5
+        self._ring.circle = (cx, y + h * 0.5, w * 0.42)
+        self._hook.bezier = [
+            cx - w * 0.16, y + h * 0.62,
+            cx - w * 0.05, y + h * 0.78,
+            cx + w * 0.14, y + h * 0.62,
+            cx, y + h * 0.44,
+        ]
+        dot_y = y + h * 0.2
+        self._dot.points = [cx, dot_y, cx, dot_y]
 
 
 # ---------- Reusable styled widgets ----------
@@ -533,7 +595,12 @@ class NavBar(BoxLayout):
         self.bind(pos=self._update, size=self._update)
 
         self.buttons = {}
-        tabs = [('home', HomeIcon, 'HOME'), ('settings', SettingsIcon, 'SETTINGS'), ('about', ProfileIcon, 'ABOUT')]
+        tabs = [
+            ('home', HomeIcon, 'HOME'),
+            ('settings', SettingsIcon, 'SETTINGS'),
+            ('about', ProfileIcon, 'ABOUT'),
+            ('help', HelpIcon, 'HELP'),
+        ]
         for key, icon_cls, label in tabs:
             btn = NavButton(icon_cls, label, on_press=lambda k=key: on_select(k))
             self.buttons[key] = btn
@@ -604,24 +671,26 @@ class HenxDownloaderApp(App):
         self.max_workers = 5
         self.auto_clear = False
         self.notify_on_finish = True
+        self.theme = 'dark'
 
-        root = FloatLayout()
+        self.root_layout = FloatLayout()
 
-        body = BoxLayout(orientation='vertical')
+        self.body = BoxLayout(orientation='vertical')
         self.sm = ScreenManager(transition=SlideTransition(duration=0.18))
         self.sm.add_widget(self._build_splash_screen())
         self.sm.add_widget(self._build_home_screen())
         self.sm.add_widget(self._build_settings_screen())
         self.sm.add_widget(self._build_about_screen())
+        self.sm.add_widget(self._build_help_screen())
         self.sm.current = 'splash'
-        body.add_widget(self.sm)
+        self.body.add_widget(self.sm)
 
         self.nav_bar = NavBar(on_select=self._switch_screen)
         self.nav_bar.opacity = 0
         self.nav_bar.height = 0
-        body.add_widget(self.nav_bar)
+        self.body.add_widget(self.nav_bar)
 
-        root.add_widget(body)
+        self.root_layout.add_widget(self.body)
 
         Clock.schedule_once(lambda dt: self._leave_splash(), 1.8)
 
@@ -635,9 +704,9 @@ class HenxDownloaderApp(App):
             self._toast_bg_color = Color(0.1, 0.11, 0.14, 0)
             self._toast_bg = RoundedRectangle(pos=self.toast_label.pos, size=self.toast_label.size, radius=[20])
         self.toast_label.bind(pos=self._update_toast_bg, size=self._update_toast_bg)
-        root.add_widget(self.toast_label)
+        self.root_layout.add_widget(self.toast_label)
 
-        return root
+        return self.root_layout
 
     def _update_toast_bg(self, *args):
         self._toast_bg.pos = self.toast_label.pos
@@ -652,13 +721,37 @@ class HenxDownloaderApp(App):
         bg_anim.start(self._toast_bg_color)
 
     def _switch_screen(self, key):
-        directions = {'home': 'right', 'settings': 'left', 'about': 'left'}
-        order = ['home', 'settings', 'about']
+        order = ['home', 'settings', 'about', 'help']
         current_idx = order.index(self.sm.current) if self.sm.current in order else 0
         target_idx = order.index(key)
         self.sm.transition.direction = 'left' if target_idx > current_idx else 'right'
         self.sm.current = key
         self.nav_bar.set_active(key)
+
+    def _on_theme_change(self, is_light):
+        """Rebuilds the three main screens with the new palette. Any
+        text typed into the URL box or an in-progress download list
+        resets when you flip this — downloads already running keep
+        going in the background either way, since those live on the
+        executor, not on the screen widgets."""
+        self.theme = 'light' if is_light else 'dark'
+        apply_palette(self.theme)
+
+        current = self.sm.current if self.sm.current != 'splash' else 'home'
+        self.sm.clear_widgets()
+        self.sm.add_widget(self._build_home_screen())
+        self.sm.add_widget(self._build_settings_screen())
+        self.sm.add_widget(self._build_about_screen())
+        self.sm.add_widget(self._build_help_screen())
+        self.sm.current = current
+
+        old_nav = self.nav_bar
+        self.nav_bar = NavBar(on_select=self._switch_screen)
+        self.nav_bar.set_active(current)
+        self.body.remove_widget(old_nav)
+        self.body.add_widget(self.nav_bar)
+
+        self.show_toast(f"Switched to {self.theme} mode")
 
     # ---------- Splash screen ----------
 
@@ -839,6 +932,17 @@ class HenxDownloaderApp(App):
         content = BoxLayout(orientation='vertical', spacing=dp(14), size_hint_y=None, padding=[0, dp(4)])
         content.bind(minimum_height=content.setter('height'))
 
+        # appearance card
+        appearance_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(4), radius=24)
+        appearance_card.add_widget(SectionLabel("APPEARANCE"))
+        theme_toggle = ToggleSwitch(active=(self.theme == 'light'), on_change=self._on_theme_change)
+        appearance_card.add_widget(SettingsRow(
+            "Light Mode", theme_toggle,
+            subtitle="Dark mode uses black/white/grey, off by default"
+        ))
+        appearance_card.height = dp(40) + dp(56) * 1 + dp(10)
+        content.add_widget(appearance_card)
+
         # downloads card
         dl_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(4), radius=24)
         dl_card.add_widget(SectionLabel("DOWNLOADS"))
@@ -969,6 +1073,48 @@ class HenxDownloaderApp(App):
         root.add_widget(btn_row)
 
         root.add_widget(Widget())
+        screen.add_widget(root)
+        return screen
+
+    # ---------- Help screen ----------
+
+    def _build_help_screen(self):
+        screen = Screen(name='help')
+        root = BoxLayout(orientation='vertical', padding=[dp(18), dp(20), dp(18), dp(10)], spacing=dp(14))
+
+        title = Label(text="How to Download", font_size='22sp', bold=True, color=TEXT_PRIMARY,
+                      halign='left', valign='middle', size_hint_y=None, height=dp(34))
+        title.bind(size=title.setter('text_size'))
+        root.add_widget(title)
+
+        scroll = ScrollView(size_hint=(1, 1))
+        content = BoxLayout(orientation='vertical', spacing=dp(14), size_hint_y=None, padding=[0, dp(4)])
+        content.bind(minimum_height=content.setter('height'))
+
+        steps = [
+            ("1. Paste your link(s)", "Copy a video or audio link, then tap Paste on the Home screen. You can paste more than one — just put each link on its own line."),
+            ("2. Pick your options", "Choose a quality (Best is the max available), or flip on Audio Only if you just want the MP3."),
+            ("3. Tap Start Download", "Every link you pasted downloads at the same time, up to the parallel-download limit you set in Settings."),
+            ("4. Check Active Tasks", "Each link gets its own progress bar and status badge — Queued, Downloading, Done, or Failed."),
+            ("Where do files go?", "Everything saves to your phone's normal Download folder, same place your browser saves files."),
+        ]
+
+        for heading, body in steps:
+            card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(6), radius=24)
+            head_lbl = Label(text=heading, font_size='14sp', bold=True, color=ACCENT,
+                              halign='left', valign='middle', size_hint_y=None, height=dp(22))
+            head_lbl.bind(size=head_lbl.setter('text_size'))
+            card.add_widget(head_lbl)
+            body_lbl = Label(text=body, font_size='12sp', color=TEXT_MUTED,
+                              halign='left', valign='top', size_hint_y=None)
+            body_lbl.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
+            body_lbl.bind(texture_size=lambda inst, ts: setattr(inst, 'height', ts[1]))
+            card.add_widget(body_lbl)
+            card.bind(minimum_height=card.setter('height'))
+            content.add_widget(card)
+
+        scroll.add_widget(content)
+        root.add_widget(scroll)
         screen.add_widget(root)
         return screen
 

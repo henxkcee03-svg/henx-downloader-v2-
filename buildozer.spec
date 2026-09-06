@@ -37,6 +37,16 @@ fullscreen = 0
 # resizes it for the various Android icon densities automatically.
 icon.filename = %(source.dir)s/icon.png
 
+# Native presplash — shown by Android while the app is loading, before
+# any Python/Kivy code runs. Set to a plain black background with the
+# icon centered, matching the in-app splash so the two blend together
+# instead of flashing a mismatched default icon/white screen first.
+# Using the exact unquoted hex format from Buildozer's own official
+# example (a quoted/named-color format has caused build failures for
+# other people, per a known Buildozer GitHub issue).
+presplash.filename = %(source.dir)s/presplash.png
+android.presplash_color = #000000
+
 # presplash — the screen shown for a split second while the app is
 # launching. Previously left unset, so Android fell back to a default
 # blank/placeholder splash that didn't match the real app icon. Using

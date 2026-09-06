@@ -24,8 +24,8 @@ jobs:
 
       - name: Build with Buildozer
         run: |
-          set -o pipefail
           yes | buildozer android debug 2>&1 | tee build_log.txt
+          exit ${PIPESTATUS[1]}
 
       - name: Upload build log (always, even on failure)
         if: always()
@@ -35,8 +35,9 @@ jobs:
           path: build_log.txt
 
       - name: Upload APK
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: henx-downloader-apk
           path: bin/*.apk
+          if-no-files-found: warn

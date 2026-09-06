@@ -47,13 +47,6 @@ icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 android.presplash_color = #000000
 
-# presplash — the screen shown for a split second while the app is
-# launching. Previously left unset, so Android fell back to a default
-# blank/placeholder splash that didn't match the real app icon. Using
-# the same icon here so launch and home-screen icon are consistent.
-presplash.filename = %(source.dir)s/icon.png
-android.presplash_color = #0e1016
-
 # ---- Android permissions ----
 # INTERNET: required to download
 # WRITE/READ_EXTERNAL_STORAGE: required to save files to /sdcard/Download
@@ -62,7 +55,7 @@ android.presplash_color = #0e1016
 # declared here — the OS will prompt the person the first time a
 # notification tries to fire; if they deny it, notifications just won't
 # show (silently, by design — this won't crash anything).
-android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,POST_NOTIFICATIONS
+android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,POST_NOTIFICATIONS,VIBRATE
 
 # ---- Android build config ----
 android.api = 33

@@ -9,7 +9,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.slider import Slider
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image as KivyImage
@@ -42,12 +42,12 @@ DARK_PALETTE = {
     'TEXT_MUTED': (0.62, 0.62, 0.62, 1),
 }
 LIGHT_PALETTE = {
-    'BG': (0.96, 0.96, 0.97, 1),
+    'BG': (0.91, 0.915, 0.925, 1),
     'SURFACE': (1, 1, 1, 1),
-    'SURFACE_2': (0.92, 0.92, 0.94, 1),
-    'BORDER': (0.83, 0.83, 0.86, 1),
+    'SURFACE_2': (0.905, 0.91, 0.925, 1),
+    'BORDER': (0.74, 0.75, 0.78, 1),
     'TEXT_PRIMARY': (0.07, 0.08, 0.1, 1),
-    'TEXT_MUTED': (0.42, 0.44, 0.5, 1),
+    'TEXT_MUTED': (0.4, 0.42, 0.47, 1),
 }
 
 BG = DARK_PALETTE['BG']
@@ -286,6 +286,54 @@ class GhostButton(Button):
         self._rect.pos = self.pos
         self._rect.size = self.size
         self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+
+
+class RoundedSpinnerOption(SpinnerOption):
+    """One row in the dropdown list. Kivy's default option is a plain
+    square grey button — this reads the current theme colors so it
+    matches dark or light mode instead of always looking like the
+    unthemed default."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.background_normal = ''
+        self.background_down = ''
+        self.background_color = (0, 0, 0, 0)
+        self.color = TEXT_PRIMARY
+        self.font_size = '13sp'
+        with self.canvas.before:
+            Color(*SURFACE_2)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+        self.bind(pos=self._update, size=self._update)
+
+    def _update(self, *args):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+
+class RoundedSpinner(Spinner):
+    """A Spinner with a true pill-shaped background (radius = half the
+    height, so it's fully rounded regardless of size) instead of Kivy's
+    default sharp-cornered box."""
+    def __init__(self, **kwargs):
+        kwargs.setdefault('option_cls', RoundedSpinnerOption)
+        super().__init__(**kwargs)
+        self.background_normal = ''
+        self.background_down = ''
+        self.background_color = (0, 0, 0, 0)
+        self.color = TEXT_PRIMARY
+        with self.canvas.before:
+            Color(*SURFACE_2)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(18)])
+            Color(*BORDER)
+            self._line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(18)), width=1.2)
+        self.bind(pos=self._update, size=self._update)
+
+    def _update(self, *args):
+        radius = self.height / 2
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        self._rect.radius = [radius]
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, radius)
 
 
 class RoundedTextInput(TextInput):
@@ -671,6 +719,7 @@ class HenxDownloaderApp(App):
         self.max_workers = 5
         self.auto_clear = False
         self.notify_on_finish = True
+        self.vibrate_on_finish = True
         self.theme = 'dark'
 
         self.root_layout = FloatLayout()
@@ -847,10 +896,9 @@ class HenxDownloaderApp(App):
         quality_wrap = BoxLayout(orientation='vertical', spacing=dp(2))
         quality_wrap.add_widget(Label(text="Quality", font_size='10sp', color=TEXT_MUTED,
                                        size_hint_y=None, height=dp(14), halign='left'))
-        self.quality_spinner = Spinner(
+        self.quality_spinner = RoundedSpinner(
             text='Best', values=('Best', '1080p', '720p', '480p', '360p'),
             size_hint_y=None, height=dp(36),
-            background_normal='', background_color=SURFACE_2, color=TEXT_PRIMARY,
             font_size='13sp'
         )
         quality_wrap.add_widget(self.quality_spinner)
@@ -969,18 +1017,37 @@ class HenxDownloaderApp(App):
             "Toast on finish", notify_toggle,
             subtitle="Show a message when downloads complete"
         ))
-        dl_card.height = dp(40) + dp(56) * 3 + dp(10)
+
+        vibrate_toggle = ToggleSwitch(active=True, on_change=self._on_vibrate_change)
+        dl_card.add_widget(SettingsRow(
+            "Vibrate on finish", vibrate_toggle,
+            subtitle="Quick buzz when a download finishes or fails"
+        ))
+        dl_card.height = dp(40) + dp(56) * 4 + dp(10)
         content.add_widget(dl_card)
 
         # storage card
-        storage_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(6), radius=24)
+        storage_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(8), radius=24)
         storage_card.add_widget(SectionLabel("STORAGE"))
-        path_label = Label(text=self.download_dir if hasattr(self, 'download_dir') else "/sdcard/Download",
-                            font_size='12sp', color=TEXT_MUTED, halign='left', valign='middle',
-                            size_hint_y=None, height=dp(24))
-        path_label.bind(size=path_label.setter('text_size'))
-        storage_card.add_widget(path_label)
-        storage_card.height = dp(70)
+        self.storage_path_label = Label(
+            text=self.download_dir, font_size='12sp', color=TEXT_MUTED,
+            halign='left', valign='middle', size_hint_y=None, height=dp(20)
+        )
+        self.storage_path_label.bind(size=self.storage_path_label.setter('text_size'))
+        storage_card.add_widget(self.storage_path_label)
+
+        subfolder_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(40), spacing=dp(8))
+        self.subfolder_input = RoundedTextInput(
+            hint_text="Optional subfolder name...", multiline=False,
+            size_hint_y=None, height=dp(40), font_size='12sp'
+        )
+        apply_btn = GhostButton(text="Set", size_hint_x=None, width=dp(60), font_size='12sp')
+        apply_btn.bind(on_press=self._apply_subfolder)
+        subfolder_row.add_widget(self.subfolder_input)
+        subfolder_row.add_widget(apply_btn)
+        storage_card.add_widget(subfolder_row)
+
+        storage_card.height = dp(126)
         content.add_widget(storage_card)
 
         # reset card
@@ -1007,10 +1074,28 @@ class HenxDownloaderApp(App):
     def _on_notify_change(self, active):
         self.notify_on_finish = active
 
+    def _on_vibrate_change(self, active):
+        self.vibrate_on_finish = active
+
+    def _apply_subfolder(self, instance):
+        name = self.subfolder_input.text.strip()
+        # strip anything that could break out of the intended folder
+        name = name.replace("..", "").replace("/", "").replace("\\", "")
+        base = "/sdcard/Download"
+        self.download_dir = os.path.join(base, name) if name else base
+        try:
+            os.makedirs(self.download_dir, exist_ok=True)
+        except Exception:
+            pass
+        self.storage_path_label.text = self.download_dir
+        self.show_toast("Downloads will save to: " + self.download_dir)
+
     def _reset_settings(self, instance):
         self.max_workers = 5
         self.auto_clear = False
         self.notify_on_finish = True
+        self.vibrate_on_finish = True
+        self.download_dir = "/sdcard/Download"
         self.show_toast("Settings restored to default")
 
     # ---------- About screen ----------
@@ -1286,7 +1371,22 @@ class HenxDownloaderApp(App):
                 "Download complete" if success else "Download failed",
                 title
             )
+        if self.vibrate_on_finish:
+            self.vibrate_device()
         self.update_summary()
+
+    def vibrate_device(self, duration=0.15):
+        """Short buzz on download finish/fail. Guarded the same way as
+        notifications and sharing — silently does nothing if unsupported
+        rather than risking a crash."""
+        from kivy.utils import platform
+        if platform != 'android':
+            return
+        try:
+            from plyer import vibrator
+            vibrator.vibrate(duration)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

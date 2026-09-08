@@ -55,7 +55,7 @@ android.presplash_color = #000000
 # declared here — the OS will prompt the person the first time a
 # notification tries to fire; if they deny it, notifications just won't
 # show (silently, by design — this won't crash anything).
-android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,POST_NOTIFICATIONS,VIBRATE
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,POST_NOTIFICATIONS,VIBRATE
 
 # ---- Android build config ----
 android.api = 33

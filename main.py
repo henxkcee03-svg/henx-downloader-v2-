@@ -987,7 +987,6 @@ class HenxDownloaderApp(App):
         subtitle.bind(size=subtitle.setter('text_size'))
         subtitle_row.add_widget(subtitle)
 
-        self.status_dot_color = Color(GOOD if self.is_online else BAD)
         status_wrap = BoxLayout(size_hint=(None, None), size=(dp(90), dp(18)), spacing=dp(5))
         dot_holder = Widget(size_hint=(None, None), size=(dp(8), dp(8)))
         with dot_holder.canvas:

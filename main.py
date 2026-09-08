@@ -1,5 +1,9 @@
 import os
 import math
+import json
+import time
+import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
@@ -14,7 +18,8 @@ from kivy.uix.slider import Slider
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
-from kivy.graphics import Color, RoundedRectangle, Line, Ellipse, Triangle, PushMatrix, PopMatrix, Rotate
+from kivy.uix.popup import Popup
+from kivy.graphics import Color, RoundedRectangle, Line, Ellipse, Triangle, PushMatrix, PopMatrix, Rotate, Translate
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.clipboard import Clipboard
@@ -206,6 +211,31 @@ class HelpIcon(VectorIcon):
         self._dot.points = [cx, dot_y, cx, dot_y]
 
 
+class FolderIcon(VectorIcon):
+    """A simple folder outline for the Files/Library tab."""
+    def _build(self):
+        self._tab = Line(width=dp(1.8), joint='round')
+        self._body = Line(width=dp(1.8), joint='round')
+
+    def _redraw(self, *args):
+        super()._redraw(*args)
+        x, y = self.pos
+        w, h = self.size
+        top = y + h * 0.68
+        self._tab.points = [
+            x + w * 0.18, top,
+            x + w * 0.4, top,
+            x + w * 0.48, top + h * 0.1,
+            x + w * 0.82, top + h * 0.1,
+        ]
+        self._body.points = [
+            x + w * 0.18, top,
+            x + w * 0.14, y + h * 0.2,
+            x + w * 0.86, y + h * 0.2,
+            x + w * 0.82, top + h * 0.1,
+        ]
+
+
 # ---------- Reusable styled widgets ----------
 
 class Card(BoxLayout):
@@ -213,6 +243,15 @@ class Card(BoxLayout):
         super().__init__(**kwargs)
         self._radius = radius
         with self.canvas.before:
+            # a soft shadow reads much better on light backgrounds than
+            # dark ones (on black, a dark shadow is invisible anyway),
+            # so only draw it in light mode — gives cards real depth
+            # instead of looking like flat grey rectangles.
+            if TEXT_PRIMARY[0] < 0.5:  # true when in light mode (dark text)
+                Color(0, 0, 0, 0.08)
+                self._shadow = RoundedRectangle(pos=self.pos, size=self.size, radius=[radius])
+            else:
+                self._shadow = None
             Color(*bg)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[radius])
             Color(*border)
@@ -220,6 +259,9 @@ class Card(BoxLayout):
         self.bind(pos=self._update, size=self._update)
 
     def _update(self, *args):
+        if self._shadow:
+            self._shadow.pos = (self.x, self.y - dp(2.5))
+            self._shadow.size = self.size
         self._rect.pos = self.pos
         self._rect.size = self.size
         self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
@@ -559,6 +601,46 @@ class SummaryBadge(BoxLayout):
         self._done, self._fail, self._total = done, fail, total
 
 
+class HeaderLogo(Widget):
+    """A small hand-drawn download arrow that continuously bobs up and
+    down, simulating a download in progress. Replaces the static
+    icon.png image in the header — that raster image had a hardcoded
+    dark background baked in, so it looked like a stray dark square
+    when the app switched to light mode. This is theme-colorable and
+    animated instead."""
+
+    def __init__(self, color=ACCENT, **kwargs):
+        kwargs.setdefault('size_hint', (None, None))
+        kwargs.setdefault('size', (dp(26), dp(26)))
+        super().__init__(**kwargs)
+        with self.canvas:
+            PushMatrix()
+            self._translate = Translate(0, 0)
+            Color(*color)
+            self._stem = Line(width=dp(2.2), cap='round')
+            self._head = Triangle()
+            self._tray = Line(width=dp(2.3), cap='round')
+            PopMatrix()
+        self.bind(pos=self._layout, size=self._layout)
+        self._layout()
+        Clock.schedule_once(lambda dt: self._loop(), 0.2)
+
+    def _layout(self, *args):
+        x, y, w, h = self.x, self.y, self.width, self.height
+        cx = x + w / 2
+        self._stem.points = [cx, y + h * 0.88, cx, y + h * 0.52]
+        half = w * 0.24
+        self._head.points = [cx - half, y + h * 0.52, cx + half, y + h * 0.52, cx, y + h * 0.28]
+        self._tray.points = [x + w * 0.2, y + h * 0.1, x + w * 0.8, y + h * 0.1]
+
+    def _loop(self):
+        down = Animation(y=-dp(4), d=0.55, t='in_out_sine')
+        up = Animation(y=0, d=0.55, t='in_out_sine')
+        seq = down + up
+        seq.repeat = True
+        seq.start(self._translate)
+
+
 class LoadingDots(Widget):
     """Three animated dots for the splash screen, drawn on canvas so they
     render identically on every device regardless of font support."""
@@ -646,6 +728,7 @@ class NavBar(BoxLayout):
         tabs = [
             ('home', HomeIcon, 'HOME'),
             ('settings', SettingsIcon, 'SETTINGS'),
+            ('files', FolderIcon, 'FILES'),
             ('about', ProfileIcon, 'ABOUT'),
             ('help', HelpIcon, 'HELP'),
         ]
@@ -720,7 +803,11 @@ class HenxDownloaderApp(App):
         self.auto_clear = False
         self.notify_on_finish = True
         self.vibrate_on_finish = True
+        self.confirm_large_batch = False
+        self.keep_screen_on = True
+        Window.keep_screen_on = True
         self.theme = 'dark'
+        self.is_online = True
 
         self.root_layout = FloatLayout()
 
@@ -731,6 +818,7 @@ class HenxDownloaderApp(App):
         self.sm.add_widget(self._build_settings_screen())
         self.sm.add_widget(self._build_about_screen())
         self.sm.add_widget(self._build_help_screen())
+        self.sm.add_widget(self._build_files_screen())
         self.sm.current = 'splash'
         self.body.add_widget(self.sm)
 
@@ -742,6 +830,10 @@ class HenxDownloaderApp(App):
         self.root_layout.add_widget(self.body)
 
         Clock.schedule_once(lambda dt: self._leave_splash(), 1.8)
+        self._check_connectivity()
+        Clock.schedule_interval(lambda dt: self._check_connectivity(), 6)
+        Clock.schedule_interval(self._check_connectivity, 5)
+        self._check_connectivity(0)
 
         # toast overlay, sits above everything
         self.toast_label = Label(
@@ -770,7 +862,7 @@ class HenxDownloaderApp(App):
         bg_anim.start(self._toast_bg_color)
 
     def _switch_screen(self, key):
-        order = ['home', 'settings', 'about', 'help']
+        order = ['home', 'settings', 'files', 'about', 'help']
         current_idx = order.index(self.sm.current) if self.sm.current in order else 0
         target_idx = order.index(key)
         self.sm.transition.direction = 'left' if target_idx > current_idx else 'right'
@@ -792,6 +884,7 @@ class HenxDownloaderApp(App):
         self.sm.add_widget(self._build_settings_screen())
         self.sm.add_widget(self._build_about_screen())
         self.sm.add_widget(self._build_help_screen())
+        self.sm.add_widget(self._build_files_screen())
         self.sm.current = current
 
         old_nav = self.nav_bar
@@ -831,6 +924,32 @@ class HenxDownloaderApp(App):
         self._splash_bg.pos = instance.pos
         self._splash_bg.size = instance.size
 
+    def _check_connectivity(self):
+        """Runs the actual (blocking) network probe on a background
+        thread so it never freezes the UI, then applies the result back
+        on the main thread via Clock.schedule_once — the standard safe
+        pattern for touching widgets from outside Kivy's own thread."""
+        def worker():
+            try:
+                socket.create_connection(("8.8.8.8", 53), timeout=2.5)
+                online = True
+            except OSError:
+                online = False
+            Clock.schedule_once(lambda dt: self._set_online_status(online))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_online_status(self, online):
+        changed = online != self.is_online
+        self.is_online = online
+        if not hasattr(self, 'status_label'):
+            return
+        color = GOOD if online else BAD
+        self.status_label.text = "Online" if online else "Offline"
+        self.status_label.color = color
+        self.status_dot_color.rgba = color
+        if changed:
+            self.show_toast("Back online" if online else "You're offline")
+
     def _leave_splash(self):
         self.sm.current = 'home'
         self.nav_bar.set_active('home')
@@ -850,7 +969,7 @@ class HenxDownloaderApp(App):
         header = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(52), spacing=dp(2))
         title_row = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(8))
         icon_slot = AnchorLayout(size_hint=(None, 1), width=dp(26))
-        icon_slot.add_widget(KivyImage(source='icon.png', size_hint=(None, None), size=(dp(26), dp(26))))
+        icon_slot.add_widget(HeaderLogo())
         title_row.add_widget(icon_slot)
         title = Label(
             text="[b]Henx[/b] [color=2ea6ff]Downloader[/color]",
@@ -860,12 +979,34 @@ class HenxDownloaderApp(App):
         title_row.add_widget(title)
         header.add_widget(title_row)
 
+        subtitle_row = BoxLayout(size_hint_y=None, height=dp(18))
         subtitle = Label(
             text="Fast, parallel media downloads", font_size='12sp',
-            color=TEXT_MUTED, halign='left', valign='middle', size_hint_y=None, height=dp(18)
+            color=TEXT_MUTED, halign='left', valign='middle'
         )
         subtitle.bind(size=subtitle.setter('text_size'))
-        header.add_widget(subtitle)
+        subtitle_row.add_widget(subtitle)
+
+        self.status_dot_color = Color(GOOD if self.is_online else BAD)
+        status_wrap = BoxLayout(size_hint=(None, None), size=(dp(90), dp(18)), spacing=dp(5))
+        dot_holder = Widget(size_hint=(None, None), size=(dp(8), dp(8)))
+        with dot_holder.canvas:
+            self.status_dot_color = Color(*(GOOD if self.is_online else BAD))
+            self.status_dot = Ellipse(pos=dot_holder.pos, size=dot_holder.size)
+        dot_holder.bind(pos=lambda inst, v: setattr(self.status_dot, 'pos', v))
+        dot_center = AnchorLayout(size_hint=(None, 1), width=dp(8))
+        dot_center.add_widget(dot_holder)
+        status_wrap.add_widget(dot_center)
+        self.status_label = Label(
+            text="Online" if self.is_online else "Offline", font_size='11sp', bold=True,
+            color=(GOOD if self.is_online else BAD), halign='left', valign='middle',
+            size_hint_x=None, width=dp(70)
+        )
+        self.status_label.bind(size=self.status_label.setter('text_size'))
+        status_wrap.add_widget(self.status_label)
+        subtitle_row.add_widget(status_wrap)
+
+        header.add_widget(subtitle_row)
         root.add_widget(header)
 
         input_card = Card(orientation='vertical', size_hint_y=None, height=dp(190),
@@ -923,7 +1064,7 @@ class HenxDownloaderApp(App):
         self.start_btn.bind(on_press=self.start_downloads)
         btn_row.add_widget(self.start_btn)
 
-        clear_btn = GhostButton(text="Clear", size_hint_x=0.28)
+        clear_btn = GhostButton(text="Clear Links", size_hint_x=0.4, font_size='12sp')
         clear_btn.bind(on_press=self.clear_input)
         btn_row.add_widget(clear_btn)
         root.add_widget(btn_row)
@@ -984,11 +1125,20 @@ class HenxDownloaderApp(App):
         appearance_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(4), radius=24)
         appearance_card.add_widget(SectionLabel("APPEARANCE"))
         theme_toggle = ToggleSwitch(active=(self.theme == 'light'), on_change=self._on_theme_change)
+        appearance_card.add_widget(SettingsRow("Light Mode", theme_toggle))
+
+        confirm_toggle = ToggleSwitch(active=self.confirm_large_batch, on_change=self._on_confirm_batch_change)
         appearance_card.add_widget(SettingsRow(
-            "Light Mode", theme_toggle,
-            subtitle="Dark mode uses black/white/grey, off by default"
+            "Confirm large batches", confirm_toggle,
+            subtitle="Ask before starting 6+ downloads at once"
         ))
-        appearance_card.height = dp(40) + dp(56) * 1 + dp(10)
+
+        screen_on_toggle = ToggleSwitch(active=self.keep_screen_on, on_change=self._on_screen_on_change)
+        appearance_card.add_widget(SettingsRow(
+            "Keep screen on", screen_on_toggle,
+            subtitle="Stop the screen sleeping while downloads run"
+        ))
+        appearance_card.height = dp(40) + dp(56) * 3 + dp(10)
         content.add_widget(appearance_card)
 
         # downloads card
@@ -1077,6 +1227,13 @@ class HenxDownloaderApp(App):
     def _on_vibrate_change(self, active):
         self.vibrate_on_finish = active
 
+    def _on_confirm_batch_change(self, active):
+        self.confirm_large_batch = active
+
+    def _on_screen_on_change(self, active):
+        self.keep_screen_on = active
+        Window.keep_screen_on = active
+
     def _apply_subfolder(self, instance):
         name = self.subfolder_input.text.strip()
         # strip anything that could break out of the intended folder
@@ -1157,6 +1314,10 @@ class HenxDownloaderApp(App):
         btn_row.add_widget(rate_btn)
         root.add_widget(btn_row)
 
+        support_btn = GhostButton(text="Support the Creator", size_hint_y=None, height=dp(46), font_size='13sp')
+        support_btn.bind(on_press=self.support_creator)
+        root.add_widget(support_btn)
+
         root.add_widget(Widget())
         screen.add_widget(root)
         return screen
@@ -1203,6 +1364,80 @@ class HenxDownloaderApp(App):
         screen.add_widget(root)
         return screen
 
+    # ---------- Files screen ----------
+
+    def _build_files_screen(self):
+        screen = Screen(name='files')
+        root = BoxLayout(orientation='vertical', padding=[dp(18), dp(20), dp(18), dp(10)], spacing=dp(14))
+
+        header_row = BoxLayout(size_hint_y=None, height=dp(34))
+        title = Label(text="Downloads", font_size='22sp', bold=True, color=TEXT_PRIMARY,
+                      halign='left', valign='middle')
+        title.bind(size=title.setter('text_size'))
+        header_row.add_widget(title)
+        refresh_btn = GhostButton(text="Refresh", size_hint=(None, None), size=(dp(80), dp(32)), font_size='12sp')
+        refresh_btn.bind(on_press=lambda x: self._refresh_files_list())
+        header_row.add_widget(refresh_btn)
+        root.add_widget(header_row)
+
+        self.files_scroll = ScrollView(size_hint=(1, 1))
+        self.files_content = BoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, padding=[0, dp(4)])
+        self.files_content.bind(minimum_height=self.files_content.setter('height'))
+        self.files_scroll.add_widget(self.files_content)
+        root.add_widget(self.files_scroll)
+
+        screen.bind(on_pre_enter=lambda inst: self._refresh_files_list())
+        screen.add_widget(root)
+        return screen
+
+    def _refresh_files_list(self):
+        self.files_content.clear_widgets()
+        try:
+            entries = []
+            if os.path.isdir(self.download_dir):
+                for name in os.listdir(self.download_dir):
+                    full = os.path.join(self.download_dir, name)
+                    if os.path.isfile(full):
+                        entries.append((name, os.path.getsize(full), os.path.getmtime(full)))
+            entries.sort(key=lambda e: e[2], reverse=True)
+        except Exception:
+            entries = []
+
+        if not entries:
+            empty = Label(
+                text="No downloads yet — finished files will show up here.",
+                font_size='13sp', color=TEXT_MUTED, halign='center',
+                size_hint_y=None, height=dp(60)
+            )
+            self.files_content.add_widget(empty)
+            return
+
+        for name, size_bytes, _ in entries:
+            card = Card(orientation='horizontal', size_hint_y=None, height=dp(56),
+                        padding=dp(12), spacing=dp(10), radius=18)
+            name_label = Label(
+                text=name, font_size='12sp', color=TEXT_PRIMARY,
+                halign='left', valign='middle', shorten=True, shorten_from='right'
+            )
+            name_label.bind(size=name_label.setter('text_size'))
+            card.add_widget(name_label)
+            size_label = Label(
+                text=self._format_size(size_bytes), font_size='11sp', color=TEXT_MUTED,
+                halign='right', valign='middle', size_hint_x=None, width=dp(70)
+            )
+            size_label.bind(size=size_label.setter('text_size'))
+            card.add_widget(size_label)
+            self.files_content.add_widget(card)
+
+    @staticmethod
+    def _format_size(num_bytes):
+        size = float(num_bytes)
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if size < 1024:
+                return f"{size:.0f} {unit}" if unit == 'B' else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
     # ---------- UI actions ----------
 
     def clear_input(self, instance):
@@ -1227,22 +1462,40 @@ class HenxDownloaderApp(App):
             Clock.schedule_once(lambda dt: self.clear_completed(), 0.6)
 
     def share_app(self, instance=None):
-        """Shares the app's own installed APK via Android's native share
-        sheet, so the person can pass it directly to someone else without
-        needing an app store listing."""
+        """Shares a text message about the app via Android's native share
+        sheet. This used to try sharing the raw installed APK file
+        directly, but that reliably fails on Android 7+ without a
+        FileProvider — a piece of native Android manifest configuration
+        that needs custom XML resources, not something safely added
+        blind through buildozer.spec after tonight's build history.
+        Sharing text needs no such setup and actually works."""
         from kivy.utils import platform
         if platform != 'android':
             self.show_toast("Sharing only works on the installed Android app")
             return
         try:
-            from jnius import autoclass
             from plyer import share
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            context = PythonActivity.mActivity
-            apk_path = context.getPackageCodePath()
-            share.share_file(apk_path)
+            share.share_text(
+                "Check out Henx Downloader — grab video or audio for free. "
+                "Ask me for the APK and I'll send it over!",
+                title="Henx Downloader"
+            )
         except Exception:
             self.show_toast("Couldn't open the share sheet on this device")
+
+    def support_creator(self, instance=None):
+        """Opens the phone's email app with a message addressed to the
+        creator, via plyer's email facade (same trusted library already
+        used for sharing/notifications/vibration)."""
+        try:
+            from plyer import email
+            email.send(
+                recipient="henxkcee03@gmail.com",
+                subject="Henx Downloader — Support",
+                create_chooser=True
+            )
+        except Exception:
+            self.show_toast("Couldn't open an email app on this device")
 
     def send_notification(self, title, message):
         """Fires a real Android system notification (visible even if the
@@ -1269,6 +1522,45 @@ class HenxDownloaderApp(App):
             self.status_box.add_widget(row)
             return
 
+        if not self.is_online:
+            self.show_toast("No internet connection right now")
+            return
+
+        if self.confirm_large_batch and len(urls) >= 6:
+            self._confirm_batch_popup(urls)
+            return
+
+        self._run_downloads(urls)
+
+    def _confirm_batch_popup(self, urls):
+        content = BoxLayout(orientation='vertical', padding=dp(16), spacing=dp(14))
+        msg = Label(
+            text=f"Start {len(urls)} downloads at once?",
+            font_size='14sp', color=TEXT_PRIMARY
+        )
+        content.add_widget(msg)
+        btn_row = BoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(44))
+        cancel_btn = GhostButton(text="Cancel", font_size='13sp')
+        confirm_btn = GradientButton(text="Start", c1=ACCENT, font_size='13sp')
+        btn_row.add_widget(cancel_btn)
+        btn_row.add_widget(confirm_btn)
+        content.add_widget(btn_row)
+
+        popup = Popup(
+            title="Confirm batch download", content=content,
+            size_hint=(0.85, None), height=dp(160),
+            separator_color=ACCENT, title_color=TEXT_PRIMARY,
+            background_color=SURFACE
+        )
+        cancel_btn.bind(on_press=popup.dismiss)
+
+        def _confirmed(instance):
+            popup.dismiss()
+            self._run_downloads(urls)
+        confirm_btn.bind(on_press=_confirmed)
+        popup.open()
+
+    def _run_downloads(self, urls):
         # rebuild the executor if the user changed the parallel-download
         # count in Settings since the last run
         if self.executor._max_workers != self.max_workers:

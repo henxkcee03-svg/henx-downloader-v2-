@@ -27,7 +27,24 @@ version = 1.0
 # widely-used, well-supported recipe in python-for-android (unlike the
 # pycryptodomex/brotli/websockets packages removed earlier, which had no
 # working recipe) — this shouldn't reopen the earlier build issues.
-requirements = hostpython3==3.11.8,python3==3.11.8,kivy==2.3.0,plyer,yt-dlp,certifi,chardet,idna,urllib3,requests
+#
+# The KivMob zip URL (not a plain PyPI name) is how KivMob's own docs say
+# to install it — it's a thin Python/pyjnius wrapper, not a compiled
+# recipe, so buildozer just pip-installs it like any pure-Python package.
+# This is the single most likely thing to break the build: ad SDKs need
+# real Gradle/AndroidX wiring (see android.gradle_dependencies and
+# android.meta_data below) that most other requirements here don't, and
+# that combination has a history of gradlew failures for other KivMob
+# users on GitHub. If a build fails after adding this line, removing it
+# (and the kivmob-specific lines below) gets you back to a known-working
+# build while you debug ads separately — nothing else in the app depends
+# on it (see the ADS_AVAILABLE guard in main.py).
+requirements = hostpython3==3.11.8,python3==3.11.8,kivy==2.3.0,plyer,yt-dlp,certifi,chardet,idna,urllib3,requests,https://github.com/MichaelStott/KivMob/archive/refs/heads/master.zip
+
+# tools/ holds generate_license.py, a standalone desktop script for
+# minting premium license keys — it has nothing to do with the app
+# itself and must never ship inside the APK.
+source.exclude_dirs = tools
 
 orientation = portrait
 fullscreen = 0
@@ -67,6 +84,32 @@ android.ndk = 25b
 android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
+
+# ---- AdMob (KivMob) ----
+# The Google Mobile Ads SDK, pulled in as a Gradle dependency rather than
+# a python-for-android recipe. android.enable_androidx is required — the
+# Ads SDK is AndroidX-only. p4a.branch=master matches KivMob's own setup
+# instructions; p4a's stable release branch has been reported to not play
+# well with this combination.
+#
+# Fixed: this used to point at com.google.firebase:firebase-ads, which
+# Google's own docs confirm is an empty/legacy alias artifact — it hasn't
+# been the real SDK for years and was fully discontinued as of Mobile
+# Ads SDK v24. That's very likely what was behind the app crashing when
+# offline: an unstable ad dependency plus (fixed separately in main.py)
+# ad requests firing before connectivity had even been checked. Pinned
+# to 22.6.0 rather than the newest release, since v24+ made breaking API
+# changes that KivMob's bundled Java bridge — last updated years ago —
+# almost certainly doesn't account for.
+android.gradle_dependencies = com.google.android.gms:play-services-ads:22.6.0
+android.enable_androidx = True
+p4a.branch = master
+# This is Google's published TEST AdMob App ID — safe to build with, but
+# it only ever serves Google's placeholder test ads. Swap it for your own
+# AdMob App ID (from your AdMob console, not an ad unit ID) before a real
+# release, or real ads will never show. ADMOB_APP_ID/BANNER_ID/
+# INTERSTITIAL_ID in main.py must be updated to match.
+android.meta_data = com.google.android.gms.ads.APPLICATION_ID=ca-app-pub-3940256099942544~3347511713
 
 [buildozer]
 log_level = 2

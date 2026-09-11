@@ -1,5 +1,12 @@
 import os
 import math
+import json
+import hmac
+import hashlib
+import base64
+import secrets
+from datetime import datetime
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
@@ -21,6 +28,75 @@ from kivy.core.clipboard import Clipboard
 from kivy.animation import Animation
 from kivy.metrics import dp
 import yt_dlp
+
+# AdMob — optional. kivmob wraps the Google Mobile Ads SDK for Kivy via a
+# python-for-android recipe; it's the least reliable part of this build
+# (p4a recipes for ad SDKs are more fragile than plain-Python packages),
+# so every use of it below is guarded — if it fails to import or fails
+# to initialize on a given device, ads just don't show. Nothing else in
+# the app depends on it.
+try:
+    from kivmob import KivMob, TestIds
+    ADS_AVAILABLE = True
+except Exception:
+    ADS_AVAILABLE = False
+
+# ---------- Licensing ----------
+# Fully offline license-key system — no server, no account, no network
+# call. A key is 8 random bytes + a 4-byte HMAC-SHA256 checksum of those
+# bytes, both base32-encoded. Validating a key just means recomputing the
+# checksum with LICENSE_SECRET and checking it matches — anyone with the
+# secret can mint unlimited valid keys locally (see generate_key.py),
+# and nobody without it can forge one.
+#
+# IMPORTANT: change this to your own private string before shipping, and
+# never commit generate_key.py (or this constant) to a public repo — if
+# the secret leaks, anyone can generate free premium keys.
+LICENSE_SECRET = "henx-CHANGE-ME-before-shipping-9f8a3d21"
+
+# ---------- AdMob IDs ----------
+# These are Google's published TEST ids — safe to build/run with as-is,
+# but they only ever show Google's placeholder test ads, never real ones
+# that earn money. Before a real release, replace all three with your
+# own from your AdMob console (Apps > your app > App settings / Ad units).
+ADMOB_APP_ID = "ca-app-pub-3940256099942544~3347511713"
+ADMOB_BANNER_ID = "ca-app-pub-3940256099942544/6300978111"
+ADMOB_INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
+
+# ---------- Selar checkout ----------
+# Selar product page for the $1 one-time "Premium — forever" unlock.
+# REPLACE with your real Selar product link: log into selar.co > create a
+# Digital Product priced at $1 (one-time, not subscription) > copy its
+# public link (looks like https://selar.co/yourname-productslug) > paste
+# it below. Until you do, this button opens Selar's homepage instead of
+# a real checkout.
+SELAR_PRODUCT_URL = "https://selar.co/YOUR-PRODUCT-LINK"
+
+
+def generate_license_key(secret=LICENSE_SECRET):
+    payload = secrets.token_bytes(8)
+    sig = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:4]
+    raw = payload + sig
+    b32 = base64.b32encode(raw).decode().rstrip('=')
+    groups = [b32[i:i + 5] for i in range(0, len(b32), 5)]
+    return "HENX-" + "-".join(groups)
+
+
+def validate_license_key(key, secret=LICENSE_SECRET):
+    try:
+        key = key.strip().upper().replace(" ", "")
+        if not key.startswith("HENX-"):
+            return False
+        body = key[5:].replace("-", "")
+        padded = body + "=" * ((8 - len(body) % 8) % 8)
+        raw = base64.b32decode(padded)
+        if len(raw) != 12:
+            return False
+        payload, sig = raw[:8], raw[8:12]
+        expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:4]
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
 # ---------- Palette ----------
 # App is dark-mode only — a true black/white/grey palette. ACCENT/ACCENT_2/
@@ -179,6 +255,33 @@ class HelpIcon(VectorIcon):
         ]
         dot_y = y + h * 0.2
         self._dot.points = [cx, dot_y, cx, dot_y]
+
+
+class HistoryIcon(VectorIcon):
+    """A clock face with a small counter-clockwise rewind tick, for the
+    download-history tab — reads as "past activity" rather than a plain
+    clock."""
+    def _build(self):
+        self._ring = Line(width=dp(1.8))
+        self._hands = Line(width=dp(1.8), joint='round', cap='round')
+        self._tick = Line(width=dp(1.6), cap='round', joint='round')
+
+    def _redraw(self, *args):
+        super()._redraw(*args)
+        cx, cy = self.center
+        w, h = self.size
+        r = min(w, h) * 0.36
+        self._ring.circle = (cx, cy, r)
+        self._hands.points = [
+            cx, cy + r * 0.55,
+            cx, cy,
+            cx + r * 0.42, cy - r * 0.1,
+        ]
+        self._tick.points = [
+            cx - r * 0.85, cy + r * 0.55,
+            cx - r * 0.98, cy + r * 0.05,
+            cx - r * 0.55, cy + r * 0.15,
+        ]
 
 
 # ---------- Reusable styled widgets ----------
@@ -620,6 +723,7 @@ class NavBar(BoxLayout):
         self.buttons = {}
         tabs = [
             ('home', HomeIcon, 'HOME'),
+            ('history', HistoryIcon, 'HISTORY'),
             ('settings', SettingsIcon, 'SETTINGS'),
             ('about', ProfileIcon, 'ABOUT'),
             ('help', HelpIcon, 'HELP'),
@@ -699,12 +803,42 @@ class HenxDownloaderApp(App):
         # connectivity state
         self.is_online = True
 
+        # download history / "cache" — persisted to a small JSON file in
+        # the app's private data dir so it survives an app restart.
+        # task_kind tracks video-vs-audio per in-flight task id so the
+        # right kind gets recorded once that task finishes.
+        self.task_kind = {}
+        self.download_history = []
+        self.site_counts = {}
+        self.history_path = os.path.join(self.user_data_dir, 'download_history.json')
+        self._load_history()
+
+        # license / premium state
+        self.is_premium = False
+        self.license_key = ""
+        self.license_path = os.path.join(self.user_data_dir, 'license.json')
+        self._load_license()
+
+        # ads — only ever initialized for non-premium users, and only if
+        # kivmob imported successfully and we're actually on Android.
+        # NOT initialized here: this used to run unconditionally on every
+        # cold start, before self.is_online had ever been checked (it just
+        # defaulted to True) — so the ad SDK would try to init and fire a
+        # live ad request even with no network, which is the most likely
+        # cause of the "crashes when my data is off" report. It's now
+        # kicked off after the first real connectivity check below, and
+        # only if that check found a connection.
+        self.ads = None
+        self.downloads_since_ad = 0
+        self._ads_ready_to_init = True
+
         self.root_layout = FloatLayout()
 
         self.body = BoxLayout(orientation='vertical')
         self.sm = ScreenManager(transition=SlideTransition(duration=0.18))
         self.sm.add_widget(self._build_splash_screen())
         self.sm.add_widget(self._build_home_screen())
+        self.sm.add_widget(self._build_history_screen())
         self.sm.add_widget(self._build_settings_screen())
         self.sm.add_widget(self._build_about_screen())
         self.sm.add_widget(self._build_help_screen())
@@ -720,7 +854,9 @@ class HenxDownloaderApp(App):
 
         Clock.schedule_once(lambda dt: self._leave_splash(), 1.8)
 
-        # connectivity: check immediately, then poll every few seconds
+        # connectivity: check immediately, then poll every few seconds.
+        # Ads are only switched on once this has actually run and found a
+        # connection — see _poll_connectivity below.
         self._poll_connectivity()
         Clock.schedule_interval(lambda dt: self._poll_connectivity(), 4)
 
@@ -751,7 +887,7 @@ class HenxDownloaderApp(App):
         bg_anim.start(self._toast_bg_color)
 
     def _switch_screen(self, key):
-        order = ['home', 'settings', 'about', 'help']
+        order = ['home', 'history', 'settings', 'about', 'help']
         current_idx = order.index(self.sm.current) if self.sm.current in order else 0
         target_idx = order.index(key)
         self.sm.transition.direction = 'left' if target_idx > current_idx else 'right'
@@ -923,10 +1059,310 @@ class HenxDownloaderApp(App):
         screen.add_widget(root)
         return screen
 
+    # ---------- History screen ----------
+
+    def _build_history_screen(self):
+        screen = Screen(name='history')
+        root = BoxLayout(orientation='vertical', padding=[dp(18), dp(20), dp(18), dp(10)], spacing=dp(14))
+
+        title_row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8))
+        title = Label(text="Download History", font_size='22sp', bold=True, color=TEXT_PRIMARY,
+                      halign='left', valign='middle')
+        title.bind(size=title.setter('text_size'))
+        title_row.add_widget(title)
+        self.clear_history_btn = GhostButton(text="Clear Cache", size_hint=(None, None),
+                                              size=(dp(110), dp(34)), font_size='12sp')
+        self.clear_history_btn.bind(on_press=self.clear_history)
+        title_row.add_widget(self.clear_history_btn)
+        root.add_widget(title_row)
+
+        cache_note = Label(
+            text="Clears the list below — files already saved to your device aren't deleted.",
+            font_size='10.5sp', color=TEXT_MUTED, halign='left', valign='middle',
+            size_hint_y=None, height=dp(16)
+        )
+        cache_note.bind(size=cache_note.setter('text_size'))
+        root.add_widget(cache_note)
+
+        # top sites card
+        top_sites_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(10), radius=24)
+        top_sites_card.add_widget(SectionLabel("TOP SITES"))
+        self.top_sites_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(34), spacing=dp(8))
+        top_sites_card.add_widget(self.top_sites_row)
+        self.top_sites_empty_lbl = Label(
+            text="Your most-pasted sources will show up here.", font_size='11.5sp',
+            color=TEXT_MUTED, halign='left', valign='middle', size_hint_y=None, height=dp(18)
+        )
+        self.top_sites_empty_lbl.bind(size=self.top_sites_empty_lbl.setter('text_size'))
+        top_sites_card.add_widget(self.top_sites_empty_lbl)
+        top_sites_card.bind(minimum_height=top_sites_card.setter('height'))
+        root.add_widget(top_sites_card)
+
+        history_header = Label(
+            text="COMPLETED DOWNLOADS", font_size='12sp', bold=True, color=TEXT_MUTED,
+            halign='left', valign='middle', size_hint_y=None, height=dp(20)
+        )
+        history_header.bind(size=history_header.setter('text_size'))
+        root.add_widget(history_header)
+
+        scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False, bar_width=dp(5), bar_color=ACCENT)
+        self.history_list_box = BoxLayout(orientation='vertical', spacing=dp(8), size_hint_y=None, padding=[0, dp(4)])
+        self.history_list_box.bind(minimum_height=self.history_list_box.setter('height'))
+        scroll.add_widget(self.history_list_box)
+        root.add_widget(scroll)
+
+        screen.add_widget(root)
+        screen.bind(on_pre_enter=lambda *a: self._refresh_history_screen())
+        self._refresh_history_screen()
+        return screen
+
+    def _refresh_history_screen(self):
+        if not hasattr(self, 'top_sites_row'):
+            return
+
+        # --- top sites ---
+        self.top_sites_row.clear_widgets()
+        ranked = sorted(self.site_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        if ranked:
+            self.top_sites_empty_lbl.opacity = 0
+            self.top_sites_empty_lbl.height = 0
+            for domain, count in ranked:
+                pill = Pill(text=f"{domain} · {count}", bg=SURFACE_2, fg=ACCENT)
+                pill.width = max(dp(70), dp(14) + len(pill.label.text) * dp(6.5))
+                self.top_sites_row.add_widget(pill)
+        else:
+            self.top_sites_empty_lbl.opacity = 1
+            self.top_sites_empty_lbl.height = dp(18)
+
+        # --- history list ---
+        self.history_list_box.clear_widgets()
+        if not self.download_history:
+            empty_lbl = Label(
+                text="No downloads yet. Finished downloads will be cached here.",
+                font_size='12sp', color=TEXT_MUTED, halign='left', valign='middle',
+                size_hint_y=None, height=dp(60)
+            )
+            empty_lbl.bind(size=empty_lbl.setter('text_size'))
+            self.history_list_box.add_widget(empty_lbl)
+            return
+
+        for entry in self.download_history:
+            card = Card(orientation='vertical', size_hint_y=None, height=dp(66),
+                        padding=[dp(14), dp(10)], spacing=dp(4), radius=18)
+            top_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(20), spacing=dp(8))
+            name_lbl = Label(text=entry.get('title', 'Unknown'), font_size='13sp', bold=True,
+                              color=TEXT_PRIMARY, halign='left', valign='middle',
+                              shorten=True, shorten_from='right')
+            name_lbl.bind(size=name_lbl.setter('text_size'))
+            top_row.add_widget(name_lbl)
+            kind = entry.get('kind', 'video')
+            kind_pill = Pill(text="AUDIO" if kind == 'audio' else "VIDEO",
+                              bg=SURFACE_2, fg=ACCENT_2 if kind == 'audio' else ACCENT)
+            top_row.add_widget(kind_pill)
+            card.add_widget(top_row)
+
+            meta_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(18), spacing=dp(8))
+            meta_lbl = Label(text=f"{entry.get('domain', 'Unknown')}  ·  {entry.get('ts', '')}",
+                              font_size='11sp', color=TEXT_MUTED, halign='left', valign='middle')
+            meta_lbl.bind(size=meta_lbl.setter('text_size'))
+            meta_row.add_widget(meta_lbl)
+            card.add_widget(meta_row)
+
+            self.history_list_box.add_widget(card)
+
+    def _friendly_site_name(self, url):
+        try:
+            netloc = urlparse(url).netloc.lower()
+            if not netloc:
+                return "Unknown"
+            netloc = netloc.split('@')[-1].split(':')[0]
+            parts = netloc.split('.')
+            if parts and parts[0] in ('www', 'm', 'mobile') and len(parts) > 2:
+                parts = parts[1:]
+            base = parts[0] if parts else netloc
+            return base.capitalize() if base else "Unknown"
+        except Exception:
+            return "Unknown"
+
+    def _load_history(self):
+        try:
+            with open(self.history_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.download_history = data.get('downloads', [])
+            self.site_counts = data.get('site_counts', {})
+        except Exception:
+            self.download_history = []
+            self.site_counts = {}
+
+    def _save_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+            with open(self.history_path, 'w', encoding='utf-8') as f:
+                json.dump({'downloads': self.download_history, 'site_counts': self.site_counts}, f)
+        except Exception:
+            pass
+
+    def _record_download(self, title, url, kind):
+        domain = self._friendly_site_name(url)
+        entry = {
+            'title': title,
+            'url': url,
+            'domain': domain,
+            'kind': kind,
+            'ts': datetime.now().strftime('%b %d, %I:%M %p'),
+        }
+        self.download_history.insert(0, entry)
+        self.download_history = self.download_history[:200]
+        self.site_counts[domain] = self.site_counts.get(domain, 0) + 1
+        self._save_history()
+        self._refresh_history_screen()
+
+    def clear_history(self, instance=None):
+        if getattr(self, '_confirm_clear_pending', False):
+            self.download_history = []
+            self.site_counts = {}
+            self._save_history()
+            self._refresh_history_screen()
+            self._confirm_clear_pending = False
+            self.clear_history_btn.text = "Clear Cache"
+            self.show_toast("History cleared")
+        else:
+            self._confirm_clear_pending = True
+            self.clear_history_btn.text = "Tap to confirm"
+            Clock.schedule_once(self._reset_clear_confirm, 3)
+
+    def _reset_clear_confirm(self, dt):
+        self._confirm_clear_pending = False
+        if hasattr(self, 'clear_history_btn'):
+            self.clear_history_btn.text = "Clear Cache"
+
+    # ---------- License / Premium ----------
+
+    def _load_license(self):
+        try:
+            with open(self.license_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            key = data.get('key', '')
+            # re-validate on load rather than trusting the stored flag —
+            # if LICENSE_SECRET ever changes, old keys stop being honored
+            # instead of silently staying "premium" forever.
+            self.is_premium = bool(key) and validate_license_key(key)
+            self.license_key = key if self.is_premium else ''
+        except Exception:
+            self.is_premium = False
+            self.license_key = ''
+
+    def _save_license(self):
+        try:
+            os.makedirs(os.path.dirname(self.license_path), exist_ok=True)
+            with open(self.license_path, 'w', encoding='utf-8') as f:
+                json.dump({'key': self.license_key}, f)
+        except Exception:
+            pass
+
+    def activate_license(self, instance=None):
+        key = self.license_input.text.strip()
+        if not key:
+            self.show_toast("Paste a license key first")
+            return
+        if not validate_license_key(key):
+            self.show_toast("That key doesn't look valid")
+            return
+        self.is_premium = True
+        self.license_key = key
+        self._save_license()
+        self._teardown_ads()
+        self.show_toast("Premium unlocked — thanks for the support!")
+        self._rebuild_settings_screen()
+
+    def remove_license(self, instance=None):
+        self.is_premium = False
+        self.license_key = ''
+        self._save_license()
+        self.max_workers = min(self.max_workers, 3)
+        # same online gate as the startup path — don't touch the ad SDK
+        # unless there's actually a connection right now
+        if self.is_online:
+            self._init_ads()
+        else:
+            self._ads_ready_to_init = True
+        self.show_toast("License removed — back to the free plan")
+        self._rebuild_settings_screen()
+
+    def _rebuild_settings_screen(self):
+        """Rebuilds the Settings screen's content in place (same Screen
+        instance, so the ScreenManager doesn't need to re-navigate) so
+        the Premium card, worker slider cap, etc. reflect new state
+        immediately — whether or not Settings happens to be on-screen."""
+        self._build_settings_screen(screen=self.sm.get_screen('settings'))
+
+    # ---------- AdMob ----------
+
+    def _init_ads(self):
+        """Sets up a banner + a preloaded interstitial. Every SDK call is
+        individually wrapped: kivmob is the single most fragile dependency
+        in this build (ad SDKs need a Gradle dependency and a manifest
+        entry that plain python-for-android packages don't), so if any one
+        step fails, the rest are skipped and the app just runs with no
+        ads instead of crashing. This is only ever called once a real
+        connectivity check has confirmed we're online — see
+        _poll_connectivity — since firing an ad request with no network
+        is the likeliest cause of a hard crash here."""
+        self.ads = None
+        if self.is_premium or not ADS_AVAILABLE or not self.is_online:
+            return
+        from kivy.utils import platform
+        if platform != 'android':
+            return
+        try:
+            ads = KivMob(ADMOB_APP_ID)
+        except Exception:
+            return
+        try:
+            ads.new_banner(ADMOB_BANNER_ID, False)
+            ads.request_banner()
+            ads.show_banner()
+        except Exception:
+            pass
+        try:
+            ads.new_interstitial(ADMOB_INTERSTITIAL_ID)
+            ads.request_interstitial()
+        except Exception:
+            pass
+        self.ads = ads
+
+    def _teardown_ads(self):
+        if self.ads:
+            try:
+                self.ads.hide_banner()
+            except Exception:
+                pass
+        self.ads = None
+
+    def _maybe_show_interstitial(self):
+        """Shows the preloaded interstitial roughly every 3rd finished
+        batch, not after every single link, so free users aren't
+        interrupted constantly. Always reloads a fresh one afterward."""
+        if not self.ads or self.is_premium or not self.is_online:
+            return
+        self.downloads_since_ad += 1
+        if self.downloads_since_ad < 3:
+            return
+        self.downloads_since_ad = 0
+        try:
+            if self.ads.is_interstitial_loaded():
+                self.ads.show_interstitial()
+            self.ads.request_interstitial()
+        except Exception:
+            pass
+
     # ---------- Settings screen ----------
 
-    def _build_settings_screen(self):
-        screen = Screen(name='settings')
+    def _build_settings_screen(self, screen=None):
+        if screen is None:
+            screen = Screen(name='settings')
+        else:
+            screen.clear_widgets()
         root = BoxLayout(orientation='vertical', padding=[dp(18), dp(20), dp(18), dp(10)], spacing=dp(14))
 
         title = Label(text="Settings", font_size='22sp', bold=True, color=TEXT_PRIMARY,
@@ -938,17 +1374,97 @@ class HenxDownloaderApp(App):
         content = BoxLayout(orientation='vertical', spacing=dp(14), size_hint_y=None, padding=[0, dp(4)])
         content.bind(minimum_height=content.setter('height'))
 
+        # premium card
+        premium_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(8), radius=24)
+        premium_card.add_widget(SectionLabel("PREMIUM"))
+
+        status_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(28), spacing=dp(10))
+        status_label = Label(text="Status", font_size='13sp', color=TEXT_PRIMARY, halign='left', valign='middle')
+        status_label.bind(size=status_label.setter('text_size'))
+        status_row.add_widget(status_label)
+        if self.is_premium:
+            self.premium_pill = Pill(text="PREMIUM", bg=(0.28, 0.22, 0.05, 1), fg=WARN)
+        else:
+            self.premium_pill = Pill(text="FREE", bg=SURFACE_2, fg=TEXT_MUTED)
+        pill_wrap = AnchorLayout(size_hint=(None, 1), width=dp(84))
+        pill_wrap.add_widget(self.premium_pill)
+        status_row.add_widget(pill_wrap)
+        premium_card.add_widget(status_row)
+
+        perks_label = Label(
+            text="$1, one-time, forever — up to 10 parallel downloads (free is capped at 3) and no ads.",
+            font_size='11.5sp', color=TEXT_MUTED, halign='left', valign='top', size_hint_y=None, height=dp(32)
+        )
+        perks_label.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
+        premium_card.add_widget(perks_label)
+
+        self.unlock_btn = GradientButton(text="Unlock Premium — $1", c1=WARN,
+                                          font_size='13sp', size_hint_y=None, height=dp(44))
+        self.unlock_btn.bind(on_press=self.unlock_premium)
+        premium_card.add_widget(self.unlock_btn)
+
+        key_hint_label = Label(
+            text="Selar emails you a license key right after payment — paste it below to activate.",
+            font_size='10.5sp', color=TEXT_MUTED, halign='left', valign='top', size_hint_y=None, height=dp(28)
+        )
+        key_hint_label.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
+        premium_card.add_widget(key_hint_label)
+
+        self.premium_activate_wrap = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(40), spacing=dp(8))
+        self.license_input = RoundedTextInput(
+            hint_text="Paste your license key...", multiline=False,
+            size_hint_y=None, height=dp(40), font_size='12sp'
+        )
+        activate_btn = GradientButton(text="Activate", c1=ACCENT, font_size='12sp',
+                                       size_hint=(None, None), size=(dp(90), dp(40)))
+        activate_btn.bind(on_press=self.activate_license)
+        self.premium_activate_wrap.add_widget(self.license_input)
+        self.premium_activate_wrap.add_widget(activate_btn)
+        premium_card.add_widget(self.premium_activate_wrap)
+
+        self.premium_thanks_label = Label(
+            text="Premium unlocked — thanks for the support!", font_size='12sp', bold=True,
+            color=GOOD, halign='left', valign='middle', size_hint_y=None, height=dp(20)
+        )
+        self.premium_thanks_label.bind(size=self.premium_thanks_label.setter('text_size'))
+        premium_card.add_widget(self.premium_thanks_label)
+
+        self.remove_license_btn = GhostButton(text="Remove License", size_hint_y=None,
+                                               height=dp(36), font_size='11sp')
+        self.remove_license_btn.bind(on_press=self.remove_license)
+        premium_card.add_widget(self.remove_license_btn)
+
+        if self.is_premium:
+            self.unlock_btn.opacity = 0
+            self.unlock_btn.height = 0
+            self.unlock_btn.disabled = True
+            key_hint_label.opacity = 0
+            key_hint_label.height = 0
+            self.premium_activate_wrap.opacity = 0
+            self.premium_activate_wrap.height = 0
+            self.premium_activate_wrap.disabled = True
+        else:
+            self.premium_thanks_label.opacity = 0
+            self.premium_thanks_label.height = 0
+            self.remove_license_btn.opacity = 0
+            self.remove_license_btn.height = 0
+            self.remove_license_btn.disabled = True
+        premium_card.bind(minimum_height=premium_card.setter('height'))
+        content.add_widget(premium_card)
+
         # downloads card
         dl_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(4), radius=24)
         dl_card.add_widget(SectionLabel("DOWNLOADS"))
 
-        self.workers_value_label = Label(text="5", font_size='14sp', bold=True, color=ACCENT,
+        worker_cap = 10 if self.is_premium else 3
+        self.max_workers = min(self.max_workers, worker_cap)
+        self.workers_value_label = Label(text=str(self.max_workers), font_size='14sp', bold=True, color=ACCENT,
                                           size_hint=(None, None), size=(dp(30), dp(30)))
-        workers_slider = Slider(min=1, max=10, value=5, step=1, size_hint_x=1)
-        workers_slider.bind(value=self._on_workers_change)
+        self.workers_slider = Slider(min=1, max=worker_cap, value=self.max_workers, step=1, size_hint_x=1)
+        self.workers_slider.bind(value=self._on_workers_change)
         workers_row = SettingsRow(
-            "Parallel downloads", workers_slider,
-            subtitle="How many links download at once"
+            "Parallel downloads", self.workers_slider,
+            subtitle="How many links download at once (Premium: up to 10)"
         )
         dl_card.add_widget(workers_row)
         dl_card.add_widget(self.workers_value_label)
@@ -1038,12 +1554,13 @@ class HenxDownloaderApp(App):
         self.show_toast("Downloads will save to: " + self.download_dir)
 
     def _reset_settings(self, instance):
-        self.max_workers = 5
+        self.max_workers = min(5, 10 if self.is_premium else 3)
         self.auto_clear = False
         self.notify_on_finish = True
         self.vibrate_on_finish = True
         self.download_dir = "/sdcard/Download"
         self.show_toast("Settings restored to default")
+        self._rebuild_settings_screen()
 
     # ---------- About screen ----------
 
@@ -1175,8 +1692,11 @@ class HenxDownloaderApp(App):
 
     def update_summary(self):
         self.summary_badge.update(self.done_count, self.fail_count, self.total_count)
-        if self.auto_clear and self.total_count > 0 and (self.done_count + self.fail_count) == self.total_count:
+        batch_finished = self.total_count > 0 and (self.done_count + self.fail_count) == self.total_count
+        if self.auto_clear and batch_finished:
             Clock.schedule_once(lambda dt: self.clear_completed(), 0.6)
+        if batch_finished:
+            Clock.schedule_once(lambda dt: self._maybe_show_interstitial(), 0.8)
 
     def share_app(self, instance=None):
         """Opens Android's native share sheet with a text message about the
@@ -1210,6 +1730,17 @@ class HenxDownloaderApp(App):
             )
         except Exception:
             self.show_toast("Couldn't open an email app on this device")
+
+    def unlock_premium(self, instance=None):
+        """Opens the $1 Selar checkout page in the device's browser. Selar
+        handles the actual payment; it isn't wired into the app itself —
+        after paying, the buyer gets a license key by email and pastes it
+        into the Activate field below to unlock premium."""
+        import webbrowser
+        try:
+            webbrowser.open(SELAR_PRODUCT_URL)
+        except Exception:
+            self.show_toast("Couldn't open the browser on this device")
 
     # ---------- connectivity ----------
 
@@ -1254,6 +1785,13 @@ class HenxDownloaderApp(App):
             self.show_toast("You're offline — connect to the internet")
         elif changed and now_online and not was_online:
             self.show_toast("Back online")
+        # ads are network-dependent, so only ever try to bring them up
+        # once we've actually confirmed there's a connection — never on
+        # a cold start where connectivity hasn't been checked yet, and
+        # never while offline.
+        if now_online and self.ads is None and self._ads_ready_to_init:
+            self._ads_ready_to_init = False
+            self._init_ads()
 
     def send_notification(self, title, message):
         """Fires a real Android system notification (visible even if the
@@ -1296,6 +1834,8 @@ class HenxDownloaderApp(App):
 
         self.status_box.clear_widgets()
         self.task_rows = {}
+        self.task_kind = {}
+        self.task_filepath = {}
         self.total_count = len(urls)
         self.done_count = 0
         self.fail_count = 0
@@ -1311,6 +1851,7 @@ class HenxDownloaderApp(App):
     def build_ydl_opts(self, task_id):
         audio_only = self.audio_toggle.active
         quality = self.quality_spinner.text
+        self.task_kind[task_id] = 'audio' if audio_only else 'video'
 
         if audio_only:
             fmt = 'bestaudio/best'
@@ -1334,6 +1875,7 @@ class HenxDownloaderApp(App):
             'no_warnings': True,
             'postprocessors': postprocessors,
             'progress_hooks': [lambda d, tid=task_id: self.progress_hook(tid, d)],
+            'postprocessor_hooks': [lambda d, tid=task_id: self.postprocessor_hook(tid, d)],
         }
 
     def progress_hook(self, task_id, d):
@@ -1345,7 +1887,22 @@ class HenxDownloaderApp(App):
                 pct = 0
             Clock.schedule_once(lambda dt: self._update_progress(task_id, pct))
         elif d.get('status') == 'finished':
+            # Baseline final path. For a plain video download (no
+            # postprocessing) this is already the real output file. For
+            # audio-extract mode it's overwritten below once the mp3
+            # conversion actually finishes, since this fires *before*
+            # that conversion — using it as-is would point at the
+            # pre-conversion temp file.
+            filepath = d.get('filename')
+            if filepath:
+                self.task_filepath[task_id] = filepath
             Clock.schedule_once(lambda dt: self._update_progress(task_id, 100))
+
+    def postprocessor_hook(self, task_id, d):
+        if d.get('status') == 'finished':
+            filepath = (d.get('info_dict') or {}).get('filepath')
+            if filepath:
+                self.task_filepath[task_id] = filepath
 
     def _update_progress(self, task_id, pct):
         row = self.task_rows.get(task_id)
@@ -1361,9 +1918,32 @@ class HenxDownloaderApp(App):
                 title = info.get('title', 'Unknown Title')[:38]
                 Clock.schedule_once(lambda dt: self._set_row(task_id, title))
                 ydl.download([url])
-                Clock.schedule_once(lambda dt: self._finish_row(task_id, title, success=True))
+                Clock.schedule_once(lambda dt: self._finish_row(task_id, title, success=True, url=url))
         except Exception:
-            Clock.schedule_once(lambda dt: self._finish_row(task_id, "Link failed", success=False))
+            Clock.schedule_once(lambda dt: self._finish_row(task_id, "Link failed", success=False, url=url))
+
+    def _scan_media_file(self, filepath):
+        """Tells Android's MediaStore to index the new file right away.
+        Without this, a file written straight to storage doesn't show up
+        in Gallery/Files apps until the next periodic system media scan
+        — which can take a long time (this is the "I have to go into my
+        gallery, and it takes a while" behavior). scanFile() itself just
+        registers the file and returns immediately — the actual indexing
+        happens on Android's own background service — so this is safe to
+        call from the UI thread (it's invoked from _finish_row). Wrapped
+        so a failure here never affects the download itself, which has
+        already finished successfully by this point."""
+        from kivy.utils import platform
+        if platform != 'android' or not filepath or not os.path.exists(filepath):
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            MediaScannerConnection = autoclass('android.media.MediaScannerConnection')
+            context = PythonActivity.mActivity
+            MediaScannerConnection.scanFile(context, [filepath], None, None)
+        except Exception:
+            pass
 
     def _set_row(self, task_id, title):
         row = self.task_rows.get(task_id)
@@ -1371,7 +1951,7 @@ class HenxDownloaderApp(App):
             row.title_label.text = title
             row.badge.set("DOWNLOADING", (0.16, 0.24, 0.34, 1), ACCENT)
 
-    def _finish_row(self, task_id, title, success):
+    def _finish_row(self, task_id, title, success, url=None):
         row = self.task_rows.get(task_id)
         if row:
             row.title_label.text = title
@@ -1382,6 +1962,11 @@ class HenxDownloaderApp(App):
                 row.badge.set("FAILED", (0.32, 0.14, 0.15, 1), BAD)
         if success:
             self.done_count += 1
+            if url:
+                self._record_download(title, url, self.task_kind.get(task_id, 'video'))
+            filepath = self.task_filepath.get(task_id)
+            if filepath:
+                self._scan_media_file(filepath)
         else:
             self.fail_count += 1
         if self.notify_on_finish:

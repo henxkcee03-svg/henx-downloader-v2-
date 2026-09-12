@@ -41,11 +41,6 @@ version = 1.0
 # on it (see the ADS_AVAILABLE guard in main.py).
 requirements = hostpython3==3.11.8,python3==3.11.8,kivy==2.3.0,plyer,yt-dlp,certifi,chardet,idna,urllib3,requests,https://github.com/MichaelStott/KivMob/archive/refs/heads/master.zip
 
-# tools/ holds generate_license.py, a standalone desktop script for
-# minting premium license keys — it has nothing to do with the app
-# itself and must never ship inside the APK.
-source.exclude_dirs = tools
-
 orientation = portrait
 fullscreen = 0
 # icon.png — a dark, glowing rounded badge (near-black gradient

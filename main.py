@@ -1,10 +1,6 @@
 import os
 import math
 import json
-import hmac
-import hashlib
-import base64
-import secrets
 from datetime import datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -41,19 +37,6 @@ try:
 except Exception:
     ADS_AVAILABLE = False
 
-# ---------- Licensing ----------
-# Fully offline license-key system — no server, no account, no network
-# call. A key is 8 random bytes + a 4-byte HMAC-SHA256 checksum of those
-# bytes, both base32-encoded. Validating a key just means recomputing the
-# checksum with LICENSE_SECRET and checking it matches — anyone with the
-# secret can mint unlimited valid keys locally (see generate_key.py),
-# and nobody without it can forge one.
-#
-# IMPORTANT: change this to your own private string before shipping, and
-# never commit generate_key.py (or this constant) to a public repo — if
-# the secret leaks, anyone can generate free premium keys.
-LICENSE_SECRET = "henx-CHANGE-ME-before-shipping-9f8a3d21"
-
 # ---------- AdMob IDs ----------
 # These are Google's published TEST ids — safe to build/run with as-is,
 # but they only ever show Google's placeholder test ads, never real ones
@@ -62,41 +45,6 @@ LICENSE_SECRET = "henx-CHANGE-ME-before-shipping-9f8a3d21"
 ADMOB_APP_ID = "ca-app-pub-3940256099942544~3347511713"
 ADMOB_BANNER_ID = "ca-app-pub-3940256099942544/6300978111"
 ADMOB_INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
-
-# ---------- Selar checkout ----------
-# Selar product page for the $1 one-time "Premium — forever" unlock.
-# REPLACE with your real Selar product link: log into selar.co > create a
-# Digital Product priced at $1 (one-time, not subscription) > copy its
-# public link (looks like https://selar.co/yourname-productslug) > paste
-# it below. Until you do, this button opens Selar's homepage instead of
-# a real checkout.
-SELAR_PRODUCT_URL = "https://selar.co/YOUR-PRODUCT-LINK"
-
-
-def generate_license_key(secret=LICENSE_SECRET):
-    payload = secrets.token_bytes(8)
-    sig = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:4]
-    raw = payload + sig
-    b32 = base64.b32encode(raw).decode().rstrip('=')
-    groups = [b32[i:i + 5] for i in range(0, len(b32), 5)]
-    return "HENX-" + "-".join(groups)
-
-
-def validate_license_key(key, secret=LICENSE_SECRET):
-    try:
-        key = key.strip().upper().replace(" ", "")
-        if not key.startswith("HENX-"):
-            return False
-        body = key[5:].replace("-", "")
-        padded = body + "=" * ((8 - len(body) % 8) % 8)
-        raw = base64.b32decode(padded)
-        if len(raw) != 12:
-            return False
-        payload, sig = raw[:8], raw[8:12]
-        expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:4]
-        return hmac.compare_digest(sig, expected)
-    except Exception:
-        return False
 
 # ---------- Palette ----------
 # App is dark-mode only — a true black/white/grey palette. ACCENT/ACCENT_2/
@@ -547,23 +495,42 @@ class ToggleSwitch(BoxLayout):
 
 class SettingsRow(BoxLayout):
     """A labeled row inside a settings card: title + optional subtitle on the
-    left, an arbitrary control widget on the right."""
+    left, an arbitrary control widget on the right. The row's height (and
+    the subtitle label's own height) now grow to fit however many lines the
+    subtitle wraps onto at the row's actual width — previously both were
+    fixed at one line's worth of height, so a subtitle long enough to wrap
+    onto two lines got its second line clipped and overlapping the row
+    underneath it."""
     def __init__(self, title, control, subtitle=None, **kwargs):
-        super().__init__(orientation='horizontal', size_hint_y=None, height=dp(56), spacing=dp(10), **kwargs)
-        text_wrap = BoxLayout(orientation='vertical')
+        super().__init__(orientation='horizontal', size_hint_y=None, spacing=dp(10), **kwargs)
+        text_wrap = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2))
+        text_wrap.bind(minimum_height=text_wrap.setter('height'))
+
         title_lbl = Label(text=title, font_size='14sp', color=TEXT_PRIMARY, bold=True,
-                           halign='left', valign='middle', size_hint_y=None, height=dp(20))
-        title_lbl.bind(size=title_lbl.setter('text_size'))
+                           halign='left', valign='top', size_hint_y=None, height=dp(20))
+        title_lbl.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
         text_wrap.add_widget(title_lbl)
+
         if subtitle:
             sub_lbl = Label(text=subtitle, font_size='11sp', color=TEXT_MUTED,
-                             halign='left', valign='middle', size_hint_y=None, height=dp(16))
-            sub_lbl.bind(size=sub_lbl.setter('text_size'))
+                             halign='left', valign='top', size_hint_y=None)
+            sub_lbl.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
+            sub_lbl.bind(texture_size=lambda inst, ts: setattr(inst, 'height', ts[1]))
             text_wrap.add_widget(sub_lbl)
+
         self.add_widget(text_wrap)
         control_wrap = BoxLayout(size_hint=(None, 1), width=dp(90))
         control_wrap.add_widget(control)
         self.add_widget(control_wrap)
+
+        text_wrap.bind(height=self._sync_height)
+        self.height = max(dp(56), text_wrap.height + dp(20))
+
+    def _sync_height(self, instance, value):
+        # dp(20) of vertical breathing room above/below the text block,
+        # with dp(56) as a floor so single-line rows keep their original
+        # comfortable height instead of shrinking to fit tightly.
+        self.height = max(dp(56), value + dp(20))
 
 
 class CheckIcon(VectorIcon):
@@ -813,14 +780,8 @@ class HenxDownloaderApp(App):
         self.history_path = os.path.join(self.user_data_dir, 'download_history.json')
         self._load_history()
 
-        # license / premium state
-        self.is_premium = False
-        self.license_key = ""
-        self.license_path = os.path.join(self.user_data_dir, 'license.json')
-        self._load_license()
-
-        # ads — only ever initialized for non-premium users, and only if
-        # kivmob imported successfully and we're actually on Android.
+        # ads — only if kivmob imported successfully and we're actually
+        # on Android.
         # NOT initialized here: this used to run unconditionally on every
         # cold start, before self.is_online had ever been checked (it just
         # defaulted to True) — so the ad SDK would try to init and fire a
@@ -1236,64 +1197,11 @@ class HenxDownloaderApp(App):
         if hasattr(self, 'clear_history_btn'):
             self.clear_history_btn.text = "Clear Cache"
 
-    # ---------- License / Premium ----------
-
-    def _load_license(self):
-        try:
-            with open(self.license_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            key = data.get('key', '')
-            # re-validate on load rather than trusting the stored flag —
-            # if LICENSE_SECRET ever changes, old keys stop being honored
-            # instead of silently staying "premium" forever.
-            self.is_premium = bool(key) and validate_license_key(key)
-            self.license_key = key if self.is_premium else ''
-        except Exception:
-            self.is_premium = False
-            self.license_key = ''
-
-    def _save_license(self):
-        try:
-            os.makedirs(os.path.dirname(self.license_path), exist_ok=True)
-            with open(self.license_path, 'w', encoding='utf-8') as f:
-                json.dump({'key': self.license_key}, f)
-        except Exception:
-            pass
-
-    def activate_license(self, instance=None):
-        key = self.license_input.text.strip()
-        if not key:
-            self.show_toast("Paste a license key first")
-            return
-        if not validate_license_key(key):
-            self.show_toast("That key doesn't look valid")
-            return
-        self.is_premium = True
-        self.license_key = key
-        self._save_license()
-        self._teardown_ads()
-        self.show_toast("Premium unlocked — thanks for the support!")
-        self._rebuild_settings_screen()
-
-    def remove_license(self, instance=None):
-        self.is_premium = False
-        self.license_key = ''
-        self._save_license()
-        self.max_workers = min(self.max_workers, 3)
-        # same online gate as the startup path — don't touch the ad SDK
-        # unless there's actually a connection right now
-        if self.is_online:
-            self._init_ads()
-        else:
-            self._ads_ready_to_init = True
-        self.show_toast("License removed — back to the free plan")
-        self._rebuild_settings_screen()
-
     def _rebuild_settings_screen(self):
         """Rebuilds the Settings screen's content in place (same Screen
         instance, so the ScreenManager doesn't need to re-navigate) so
-        the Premium card, worker slider cap, etc. reflect new state
-        immediately — whether or not Settings happens to be on-screen."""
+        the worker slider cap etc. reflect new state immediately —
+        whether or not Settings happens to be on-screen."""
         self._build_settings_screen(screen=self.sm.get_screen('settings'))
 
     # ---------- AdMob ----------
@@ -1309,7 +1217,7 @@ class HenxDownloaderApp(App):
         _poll_connectivity — since firing an ad request with no network
         is the likeliest cause of a hard crash here."""
         self.ads = None
-        if self.is_premium or not ADS_AVAILABLE or not self.is_online:
+        if not ADS_AVAILABLE or not self.is_online:
             return
         from kivy.utils import platform
         if platform != 'android':
@@ -1343,7 +1251,7 @@ class HenxDownloaderApp(App):
         """Shows the preloaded interstitial roughly every 3rd finished
         batch, not after every single link, so free users aren't
         interrupted constantly. Always reloads a fresh one afterward."""
-        if not self.ads or self.is_premium or not self.is_online:
+        if not self.ads or not self.is_online:
             return
         self.downloads_since_ad += 1
         if self.downloads_since_ad < 3:
@@ -1374,89 +1282,11 @@ class HenxDownloaderApp(App):
         content = BoxLayout(orientation='vertical', spacing=dp(14), size_hint_y=None, padding=[0, dp(4)])
         content.bind(minimum_height=content.setter('height'))
 
-        # premium card
-        premium_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(8), radius=24)
-        premium_card.add_widget(SectionLabel("PREMIUM"))
-
-        status_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(28), spacing=dp(10))
-        status_label = Label(text="Status", font_size='13sp', color=TEXT_PRIMARY, halign='left', valign='middle')
-        status_label.bind(size=status_label.setter('text_size'))
-        status_row.add_widget(status_label)
-        if self.is_premium:
-            self.premium_pill = Pill(text="PREMIUM", bg=(0.28, 0.22, 0.05, 1), fg=WARN)
-        else:
-            self.premium_pill = Pill(text="FREE", bg=SURFACE_2, fg=TEXT_MUTED)
-        pill_wrap = AnchorLayout(size_hint=(None, 1), width=dp(84))
-        pill_wrap.add_widget(self.premium_pill)
-        status_row.add_widget(pill_wrap)
-        premium_card.add_widget(status_row)
-
-        perks_label = Label(
-            text="$1, one-time, forever — up to 10 parallel downloads (free is capped at 3) and no ads.",
-            font_size='11.5sp', color=TEXT_MUTED, halign='left', valign='top', size_hint_y=None, height=dp(32)
-        )
-        perks_label.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
-        premium_card.add_widget(perks_label)
-
-        self.unlock_btn = GradientButton(text="Unlock Premium — $1", c1=WARN,
-                                          font_size='13sp', size_hint_y=None, height=dp(44))
-        self.unlock_btn.bind(on_press=self.unlock_premium)
-        premium_card.add_widget(self.unlock_btn)
-
-        key_hint_label = Label(
-            text="Selar emails you a license key right after payment — paste it below to activate.",
-            font_size='10.5sp', color=TEXT_MUTED, halign='left', valign='top', size_hint_y=None, height=dp(28)
-        )
-        key_hint_label.bind(width=lambda inst, w: setattr(inst, 'text_size', (w, None)))
-        premium_card.add_widget(key_hint_label)
-
-        self.premium_activate_wrap = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(40), spacing=dp(8))
-        self.license_input = RoundedTextInput(
-            hint_text="Paste your license key...", multiline=False,
-            size_hint_y=None, height=dp(40), font_size='12sp'
-        )
-        activate_btn = GradientButton(text="Activate", c1=ACCENT, font_size='12sp',
-                                       size_hint=(None, None), size=(dp(90), dp(40)))
-        activate_btn.bind(on_press=self.activate_license)
-        self.premium_activate_wrap.add_widget(self.license_input)
-        self.premium_activate_wrap.add_widget(activate_btn)
-        premium_card.add_widget(self.premium_activate_wrap)
-
-        self.premium_thanks_label = Label(
-            text="Premium unlocked — thanks for the support!", font_size='12sp', bold=True,
-            color=GOOD, halign='left', valign='middle', size_hint_y=None, height=dp(20)
-        )
-        self.premium_thanks_label.bind(size=self.premium_thanks_label.setter('text_size'))
-        premium_card.add_widget(self.premium_thanks_label)
-
-        self.remove_license_btn = GhostButton(text="Remove License", size_hint_y=None,
-                                               height=dp(36), font_size='11sp')
-        self.remove_license_btn.bind(on_press=self.remove_license)
-        premium_card.add_widget(self.remove_license_btn)
-
-        if self.is_premium:
-            self.unlock_btn.opacity = 0
-            self.unlock_btn.height = 0
-            self.unlock_btn.disabled = True
-            key_hint_label.opacity = 0
-            key_hint_label.height = 0
-            self.premium_activate_wrap.opacity = 0
-            self.premium_activate_wrap.height = 0
-            self.premium_activate_wrap.disabled = True
-        else:
-            self.premium_thanks_label.opacity = 0
-            self.premium_thanks_label.height = 0
-            self.remove_license_btn.opacity = 0
-            self.remove_license_btn.height = 0
-            self.remove_license_btn.disabled = True
-        premium_card.bind(minimum_height=premium_card.setter('height'))
-        content.add_widget(premium_card)
-
         # downloads card
         dl_card = Card(orientation='vertical', size_hint_y=None, padding=dp(16), spacing=dp(4), radius=24)
         dl_card.add_widget(SectionLabel("DOWNLOADS"))
 
-        worker_cap = 10 if self.is_premium else 3
+        worker_cap = 10
         self.max_workers = min(self.max_workers, worker_cap)
         self.workers_value_label = Label(text=str(self.max_workers), font_size='14sp', bold=True, color=ACCENT,
                                           size_hint=(None, None), size=(dp(30), dp(30)))
@@ -1464,7 +1294,7 @@ class HenxDownloaderApp(App):
         self.workers_slider.bind(value=self._on_workers_change)
         workers_row = SettingsRow(
             "Parallel downloads", self.workers_slider,
-            subtitle="How many links download at once (Premium: up to 10)"
+            subtitle="How many links download at once"
         )
         dl_card.add_widget(workers_row)
         dl_card.add_widget(self.workers_value_label)
@@ -1486,7 +1316,7 @@ class HenxDownloaderApp(App):
             "Vibrate on finish", vibrate_toggle,
             subtitle="Quick buzz when a download finishes or fails"
         ))
-        dl_card.height = dp(40) + dp(56) * 4 + dp(10)
+        dl_card.bind(minimum_height=dl_card.setter('height'))
         content.add_widget(dl_card)
 
         # storage card
@@ -1554,7 +1384,7 @@ class HenxDownloaderApp(App):
         self.show_toast("Downloads will save to: " + self.download_dir)
 
     def _reset_settings(self, instance):
-        self.max_workers = min(5, 10 if self.is_premium else 3)
+        self.max_workers = 5
         self.auto_clear = False
         self.notify_on_finish = True
         self.vibrate_on_finish = True
@@ -1730,17 +1560,6 @@ class HenxDownloaderApp(App):
             )
         except Exception:
             self.show_toast("Couldn't open an email app on this device")
-
-    def unlock_premium(self, instance=None):
-        """Opens the $1 Selar checkout page in the device's browser. Selar
-        handles the actual payment; it isn't wired into the app itself —
-        after paying, the buyer gets a license key by email and pastes it
-        into the Activate field below to unlock premium."""
-        import webbrowser
-        try:
-            webbrowser.open(SELAR_PRODUCT_URL)
-        except Exception:
-            self.show_toast("Couldn't open the browser on this device")
 
     # ---------- connectivity ----------
 
